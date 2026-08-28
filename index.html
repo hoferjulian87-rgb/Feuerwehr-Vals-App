@@ -312,9 +312,6 @@ nav button.active{background:var(--fv-red)!important;color:#fff}
     <input id="memberName" placeholder="Max Mustermann">
     <label>E-Mail</label>
     <input id="memberEmail" type="email" placeholder="max@feuerwehr-vals.at">
-    <label>WhatsApp-Telefonnummer</label>
-    <input id="memberPhone" type="tel" placeholder="+39 347 1234567">
-    <div class="muted">Bitte mit Ländervorwahl speichern, z. B. +39...</div>
     <label>Startpasswort</label>
     <input id="memberPassword" type="password" placeholder="Mindestens 8 Zeichen">
     <button class="btn primary" style="width:100%" id="createMemberBtn" type="button">Mitglied anlegen</button>
@@ -333,6 +330,9 @@ nav button.active{background:var(--fv-red)!important;color:#fff}
     <input id="time" type="time">
     <label>Ort</label>
     <input id="place" placeholder="Feuerwehrhaus">
+    <label>Benötigte FF-Männer</label>
+    <input id="requiredMen" type="number" min="1" step="1" placeholder="z. B. 8">
+    <p class="muted" style="margin-top:-6px">Optional: Sobald diese Anzahl zugesagt hat, können sich keine weiteren Mitglieder mehr zusagen.</p>
     <label>Beschreibung</label>
     <textarea id="desc"></textarea>
     <label class="row" style="margin:4px 0 12px;cursor:pointer">
@@ -350,9 +350,6 @@ nav button.active{background:var(--fv-red)!important;color:#fff}
     <div class="row between"><h2>Mitglied bearbeiten</h2><button class="btn soft" id="closeEditMember" type="button">✕</button></div>
     <label>Name</label>
     <input id="editMemberName" placeholder="Name">
-    <label>WhatsApp-Telefonnummer</label>
-    <input id="editMemberPhone" type="tel" placeholder="+39 347 1234567">
-    <div class="muted">Diese Nummer wird für WhatsApp-Erinnerungen verwendet.</div>
     <label>Rolle</label>
     <select id="editMemberRole">
       <option value="member">Mitglied</option>
@@ -378,6 +375,7 @@ let profile = null;
 let events = [];
 let filter = 'all';
 let realtimeChannel = null;
+let eventResponseStats = {};
 
 const $ = id => document.getElementById(id);
 
@@ -403,7 +401,6 @@ function show(viewId, navButton){
   if(navButton) navButton.classList.add('active');
   if(viewId === 'people') loadResponses();
   if(viewId === 'tasks') loadTasks();
-  if(viewId === 'probes') loadProbes();
   if(viewId === 'password' && $('passwordEmail')) {
     $('passwordEmail').textContent = user?.email || '—';
     $('passwordChangeError').textContent = '';
@@ -526,7 +523,6 @@ async function boot(){
   if(isAdmin) await loadMembers();
 
   await loadEvents();
-  await loadProbes();
   await applyWhatsAppResponseFromLink();
   if(isAdmin) await loadAdminAttendance();
 
@@ -537,7 +533,6 @@ async function boot(){
   realtimeChannel = sb.channel('fw-events')
     .on('postgres_changes',{event:'*',schema:'public',table:'events'},()=>loadEvents())
     .on('postgres_changes',{event:'*',schema:'public',table:'responses'},()=>{ loadEvents(); if(profile?.role === 'admin') loadAdminAttendance(); })
-    .on('postgres_changes',{event:'*',schema:'public',table:'probes'},()=>loadProbes())
     .on('postgres_changes',{event:'*',schema:'public',table:'profiles'},()=>{
       if(profile?.role === 'admin'){
         loadMembers();
@@ -551,7 +546,7 @@ async function boot(){
 async function loadEvents(){
   const result = await sb
     .from('events')
-    .select('id,title,date,time,place,description,created_by')
+    .select('id,title,date,time,place,description,created_by,required_ff_men')
     .order('date',{ascending:true})
     .order('time',{ascending:true});
 
@@ -564,6 +559,7 @@ async function loadEvents(){
   }
 
   events = result.data || [];
+  await loadEventResponseStats();
 
   const current = $('eventSelect').value;
   $('eventSelect').innerHTML = events.map(e =>
@@ -586,6 +582,41 @@ async function loadEvents(){
   if(profile?.role === 'admin') await loadAdminAttendance();
 }
 
+async function loadEventResponseStats(){
+  eventResponseStats = {};
+  if(!events.length) return;
+
+  const ids = events.map(e => e.id);
+  const {data,error} = await sb.from('responses').select('event_id,user_id,status').in('event_id',ids);
+  if(error){
+    console.error('RESPONSE STATS ERROR', error);
+    return;
+  }
+
+  for(const e of events){
+    eventResponseStats[e.id] = {yes:0,no:0,mine:'offen'};
+  }
+  for(const row of (data || [])){
+    const stat = eventResponseStats[row.event_id] || (eventResponseStats[row.event_id] = {yes:0,no:0,mine:'offen'});
+    if(row.status === 'ja') stat.yes++;
+    if(row.status === 'nein') stat.no++;
+    if(row.user_id === user?.id) stat.mine = row.status;
+  }
+}
+
+function eventCapacityText(e){
+  const cap = Number(e?.required_ff_men || 0);
+  const yes = eventResponseStats[e?.id]?.yes || 0;
+  if(!cap) return '👨‍🚒 Keine Begrenzung';
+  return `👨‍🚒 Benötigt: ${cap} · Zugesagt: ${yes}/${cap}${yes >= cap ? ' · VOLL' : ` · Noch ${Math.max(0,cap-yes)} frei`}`;
+}
+
+function eventIsFullForUser(e){
+  const cap = Number(e?.required_ff_men || 0);
+  const stat = eventResponseStats[e?.id] || {yes:0,mine:'offen'};
+  return cap > 0 && stat.yes >= cap && stat.mine !== 'ja';
+}
+
 function renderHome(){
   const e = events[0];
 
@@ -603,7 +634,7 @@ function renderHome(){
 
   $('heroDate').textContent = fmt(e.date);
   $('heroTitle').textContent = e.title;
-  $('heroMeta').textContent = `${e.time} Uhr · ${e.place}`;
+  $('heroMeta').textContent = `${e.time} Uhr · ${e.place}${Number(e.required_ff_men||0) ? ` · 👨‍🚒 ${eventResponseStats[e.id]?.yes||0}/${e.required_ff_men}` : ''}`;
 
   $('homeEvents').innerHTML = events.slice(0,3).map(e =>
     `<div class="event" data-select-event="${escapeAttr(e.id)}">
@@ -665,9 +696,10 @@ function renderEvents(){
       <div class="date">${escapeHtml(fmt(e.date))} · ${escapeHtml(e.time)}</div>
       <h3 style="margin:4px 0">${escapeHtml(e.title)}</h3>
       <div class="muted">📍 ${escapeHtml(e.place || '—')}</div>
+      <div class="muted" style="margin-top:6px">${escapeHtml(eventCapacityText(e))}</div>
       ${e.description ? `<div class="muted" style="margin-top:7px">${escapeHtml(e.description)}</div>` : ''}
       <div class="row" style="margin-top:11px;flex-wrap:wrap">
-        <button class="btn yes" data-response="${escapeAttr(e.id)}" data-status="ja" type="button">Zusagen</button>
+        <button class="btn yes" data-response="${escapeAttr(e.id)}" data-status="ja" type="button" ${eventIsFullForUser(e) ? 'disabled title="Alle benötigten FF-Männer haben bereits zugesagt"' : ''}>${eventIsFullForUser(e) ? 'Voll – keine Zusage mehr' : 'Zusagen'}</button>
         <button class="btn no" data-response="${escapeAttr(e.id)}" data-status="nein" type="button">Absagen</button>
         <button class="btn soft" data-participants="${escapeAttr(e.id)}" type="button">Teilnehmer</button>
         <button class="btn soft" data-share="${escapeAttr(e.id)}" type="button">WhatsApp</button>
@@ -702,6 +734,11 @@ function renderEvents(){
 
 async function setResponse(eventId,status){
   if(!user) return;
+  const e = events.find(x => x.id === eventId);
+  if(status === 'ja' && e && eventIsFullForUser(e)){
+    toast('Diese Veranstaltung ist bereits voll. Es können keine weiteren Zusagen angenommen werden.');
+    return;
+  }
 
   const { error } = await sb
     .from('responses')
@@ -744,7 +781,8 @@ function shareEvent(id){
 📅 ${fmt(e.date)}
 🕐 ${e.time} Uhr
 📍 ${e.place}
-
+${Number(e.required_ff_men || 0) ? `👨‍🚒 Benötigt: ${e.required_ff_men} FF-Männer
+` : ''}
 ${e.title}
 ${e.description || ''}
 
@@ -767,8 +805,13 @@ async function applyWhatsAppResponseFromLink(){
   const status = params.get('antwort');
   if(!eventId || !['ja','nein'].includes(status) || !user) return;
 
-  if(!events.some(e => e.id === eventId)){
+  const linkedEvent = events.find(e => e.id === eventId);
+  if(!linkedEvent){
     toast('Diese Veranstaltung wurde nicht gefunden.');
+    return;
+  }
+  if(status === 'ja' && eventIsFullForUser(linkedEvent)){
+    toast('Diese Veranstaltung ist bereits voll. Deine Zusage konnte nicht mehr angenommen werden.');
     return;
   }
 
@@ -847,7 +890,8 @@ async function loadResponses(){
   const no = all.filter(p => map[p.id] === 'nein').length;
   const open = Math.max(0,all.length-yes-no);
 
-  $('peopleBadge').textContent = `${yes} ✓ · ${no} ✕ · ${open} offen`;
+  const cap = Number(e.required_ff_men || 0);
+  $('peopleBadge').textContent = cap ? `${yes}/${cap} zugesagt · ${no} ✕ · ${open} offen${yes >= cap ? ' · VOLL' : ` · Noch ${Math.max(0,cap-yes)} frei`}` : `${yes} ✓ · ${no} ✕ · ${open} offen`;
 
   $('peopleList').innerHTML =
     filtered.map(p =>
@@ -896,7 +940,7 @@ async function loadAdminAttendance(){
   const yes = people.filter(p => p.status === 'ja');
   const no = people.filter(p => p.status === 'nein');
   const open = people.filter(p => p.status !== 'ja' && p.status !== 'nein');
-  $('adminYesCount').textContent = yes.length;
+  $('adminYesCount').textContent = Number(e.required_ff_men || 0) ? `${yes.length} / ${e.required_ff_men}` : yes.length;
   $('adminNoCount').textContent = no.length;
   $('adminOpenCount').textContent = open.length;
   const render = (list,cls,label,empty) => list.length ? list.map(p => `<div class="person"><span>👨‍🚒 ${escapeHtml(p.name || 'Ohne Namen')}</span><span class="status ${cls}">${label}</span></div>`).join('') : `<div class="muted">${empty}</div>`;
@@ -910,7 +954,7 @@ async function loadMembers(){
 
   const result = await sb
     .from('profiles')
-    .select('id,name,email,phone,role,created_at')
+    .select('id,name,email,role,created_at')
     .order('name');
 
   if(result.error){
@@ -925,8 +969,7 @@ async function loadMembers(){
   const filtered = all.filter(p =>
     !query ||
     (p.name || '').toLowerCase().includes(query) ||
-    (p.email || '').toLowerCase().includes(query) ||
-    (p.phone || '').toLowerCase().includes(query)
+    (p.email || '').toLowerCase().includes(query)
   );
 
   $('memberCount').textContent = `${filtered.length} von ${all.length} Mitglied${all.length===1?'':'ern'}`;
@@ -939,7 +982,7 @@ async function loadMembers(){
       return `<div class="person">
         <span>
           <span class="member-name">👨‍🚒 ${escapeHtml(p.name || 'Ohne Namen')}</span>
-          <small class="muted" style="display:block">${p.email ? '✉️ '+escapeHtml(p.email)+' · ' : ''}${p.phone ? '📱 '+escapeHtml(p.phone)+' · ' : ''}${p.role==='admin'?'Administrator':'Mitglied'}${created?' · angelegt am '+escapeHtml(created):''}</small>
+          <small class="muted" style="display:block">${p.email ? '✉️ '+escapeHtml(p.email)+' · ' : ''}${p.role==='admin'?'Administrator':'Mitglied'}${created?' · angelegt am '+escapeHtml(created):''}</small>
         </span>
         <div class="admin-actions">
           <span class="badge">${p.role==='admin'?'ADMIN':'MITGLIED'}</span>
@@ -994,13 +1037,12 @@ function openEditMember(id){
   $('editMemberError').textContent = '';
 
   // Die aktuellen Werte direkt aus Supabase laden
-  sb.from('profiles').select('id,name,phone,role').eq('id',id).single().then(({data,error}) => {
+  sb.from('profiles').select('id,name,role').eq('id',id).single().then(({data,error}) => {
     if(error){
       $('editMemberError').textContent = error.message;
       return;
     }
     $('editMemberName').value = data.name || '';
-    $('editMemberPhone').value = data.phone || '';
     $('editMemberRole').value = data.role || 'member';
     $('editMemberModal').classList.add('show');
   });
@@ -1017,7 +1059,6 @@ async function saveMember(){
   if(profile?.role !== 'admin' || !editingMemberId) return;
 
   const name = $('editMemberName').value.trim();
-  const phone = $('editMemberPhone').value.trim();
   const role = $('editMemberRole').value;
 
   if(!name){
@@ -1031,7 +1072,7 @@ async function saveMember(){
 
   const {error} = await sb
     .from('profiles')
-    .update({name,phone:phone || null,role})
+    .update({name,role})
     .eq('id',editingMemberId);
 
   btn.disabled = false;
@@ -1090,7 +1131,6 @@ async function createMember(){
 
   const name = $('memberName').value.trim();
   const email = $('memberEmail').value.trim();
-  const phone = $('memberPhone').value.trim();
   const password = $('memberPassword').value;
 
   if(!name || !email || password.length < 8){
@@ -1105,7 +1145,7 @@ async function createMember(){
 
   try{
     const result = await sb.functions.invoke('smart-action',{
-      body:{name,email,phone,password}
+      body:{name,email,password}
     });
 
     if(result.error) throw result.error;
@@ -1116,14 +1156,13 @@ async function createMember(){
     if(newUserId){
       const {error: profileUpsertError} = await sb
         .from('profiles')
-        .upsert({id:newUserId,name,email,phone:phone || null,role:'member'},{onConflict:'id'});
+        .upsert({id:newUserId,name,role:'member'},{onConflict:'id'});
       if(profileUpsertError) throw profileUpsertError;
     }
 
     toast('Mitglied angelegt ✓');
     $('memberName').value = '';
     $('memberEmail').value = '';
-    $('memberPhone').value = '';
     $('memberPassword').value = '';
     closeMember();
     await loadMembers();
@@ -1148,6 +1187,7 @@ function openCreate(){
   $('date').value = '';
   $('time').value = '';
   $('place').value = '';
+  $('requiredMen').value = '';
   $('desc').value = '';
   $('shareWhatsApp').checked = false;
   $('eventError').textContent = '';
@@ -1166,6 +1206,7 @@ function openEditEvent(id){
   $('date').value = e.date || '';
   $('time').value = e.time || '';
   $('place').value = e.place || '';
+  $('requiredMen').value = e.required_ff_men || '';
   $('desc').value = e.description || '';
   $('shareWhatsApp').checked = false;
   $('eventError').textContent = '';
@@ -1173,10 +1214,7 @@ function openEditEvent(id){
 }
 
 async function deleteEvent(id){
-  if(profile?.role !== 'admin'){
-    toast('Nur Administratoren dürfen Veranstaltungen löschen.');
-    return;
-  }
+  if(profile?.role !== 'admin') return;
   const e = events.find(x => x.id === id);
   if(!e) return;
 
@@ -1184,11 +1222,7 @@ async function deleteEvent(id){
 
   const {error} = await sb.from('events').delete().eq('id', id);
   if(error){
-    console.error('EVENT DELETE ERROR', error);
     toast('Löschen fehlgeschlagen: ' + error.message);
-    if(error.code === '42501' || /row-level security|policy|permission/i.test(error.message || '')){
-      alert('Supabase blockiert das Löschen. Führe die Datei supabase_fix.sql im Supabase SQL Editor aus.');
-    }
     return;
   }
 
@@ -1217,6 +1251,7 @@ async function createEvent(){
     date: $('date').value,
     time: $('time').value,
     place: $('place').value.trim() || '—',
+    required_ff_men: (() => { const n = parseInt($('requiredMen').value,10); return Number.isInteger(n) && n > 0 ? n : null; })(),
     description: $('desc').value.trim(),
     created_by: user.id
   };
@@ -1251,6 +1286,7 @@ async function createEvent(){
     $('date').value = '';
     $('time').value = '';
     $('place').value = '';
+    $('requiredMen').value = '';
     $('desc').value = '';
     $('shareWhatsApp').checked = false;
 
@@ -1272,7 +1308,7 @@ async function createEvent(){
       (err?.message || String(err));
   }finally{
     btn.disabled = false;
-    btn.textContent = 'Veranstaltung erstellen';
+    btn.textContent = editingEventId ? 'Änderungen speichern' : 'Veranstaltung erstellen';
   }
 }
 
@@ -1283,7 +1319,8 @@ function shareEventByObject(e){
 📅 ${fmt(e.date)}
 🕐 ${e.time} Uhr
 📍 ${e.place}
-
+${Number(e.required_ff_men || 0) ? `👨‍🚒 Benötigt: ${e.required_ff_men} FF-Männer
+` : ''}
 ${e.title}
 ${e.description || ''}
 
@@ -1605,14 +1642,7 @@ async function loadProbes(){
  const list=document.getElementById('probeList'); if(!list)return;
  list.innerHTML='<div class="muted">Wird geladen…</div>';
  const {data,error}=await sb.from('probes').select('*').order('probe_date',{ascending:true});
- if(error){
-    console.error('PROBES LOAD ERROR', error);
-    list.innerHTML='<div class="error"><b>Proben konnten nicht geladen werden.</b><br>'+escapeHtml(error.message)+'</div>';
-    if(error.code==='42P01' || /relation .*probes.* does not exist/i.test(error.message||'')){
-      list.innerHTML+='<div class="muted" style="margin-top:8px">Die Tabelle „probes“ fehlt noch. Führe supabase_fix.sql aus.</div>';
-    }
-    return;
-  }
+ if(error){list.innerHTML='<div class="error">'+escapeHtml(error.message)+'</div>';return}
  probes=data||[];
  if(!probes.length){list.innerHTML='<div class="muted">Noch keine Proben vorhanden.</div>';return}
  list.innerHTML=probes.map(p=>{
